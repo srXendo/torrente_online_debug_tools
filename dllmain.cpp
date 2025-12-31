@@ -1,0 +1,294 @@
+// dllsub.cpp
+#include <windows.h>
+#include <d3d8.h>
+
+#include <d3d8types.h>
+#include <stdio.h>    // FILE, stdout, setvbuf
+#include <fcntl.h>    // _O_TEXT
+#include <io.h>       // _open_osfhandle
+#include <psapi.h>
+#include <cstdio>
+#include "MinHook.h"
+#include <cstdint>
+#include <cstdio>
+
+#include "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/atlmfc/include/atlstr.h"
+
+HMODULE g_hModule = nullptr;
+
+typedef void(__cdecl* VtMessageBox)(const ATL::CString& text);
+typedef void(__thiscall* VtGraph_TestCooperativeLevel)();
+typedef void(__thiscall* VtGraph_DebugInfo_GetNumDrawPolys)(BOOL param);
+typedef void(__thiscall* SetDebugMsgRender)(BOOL param);
+typedef void(__cdecl* VtEnableLogs)(bool enable);
+
+
+void* d3d8table[119];
+
+//void** d3d8_vtable = new void*[119];
+
+typedef HRESULT(STDMETHODCALLTYPE* tEndScene)(IDirect3DDevice8*);
+tEndScene oEndScene = nullptr;
+
+
+
+struct DX8StateBackup
+{
+    DWORD vertexShader;
+    DWORD zEnable;
+    DWORD alphaBlend;
+    DWORD srcBlend;
+    DWORD destBlend;
+    DWORD lighting;
+    D3DVIEWPORT8 viewport;
+};
+
+void BackupState(IDirect3DDevice8* dev, DX8StateBackup& s)
+{
+    dev->GetVertexShader(&s.vertexShader);
+    dev->GetRenderState(D3DRS_ZENABLE, &s.zEnable);
+    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &s.alphaBlend);
+    dev->GetRenderState(D3DRS_SRCBLEND, &s.srcBlend);
+    dev->GetRenderState(D3DRS_DESTBLEND, &s.destBlend);
+    dev->GetRenderState(D3DRS_LIGHTING, &s.lighting);
+    dev->GetViewport(&s.viewport);
+}
+
+void RestoreState(IDirect3DDevice8* dev, DX8StateBackup& s)
+{
+    dev->SetVertexShader(s.vertexShader);
+    dev->SetRenderState(D3DRS_ZENABLE, s.zEnable);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, s.alphaBlend);
+    dev->SetRenderState(D3DRS_SRCBLEND, s.srcBlend);
+    dev->SetRenderState(D3DRS_DESTBLEND, s.destBlend);
+    dev->SetRenderState(D3DRS_LIGHTING, s.lighting);
+    dev->SetViewport(&s.viewport);
+}
+
+
+struct VERTEX
+{
+    float x, y, z, rhw;
+    DWORD color;
+};
+
+#define FVF (D3DFVF_XYZRHW | D3DFVF_DIFFUSE)
+
+
+void DrawRectDX8_Safe(
+    IDirect3DDevice8* dev,
+    float x, float y,
+    float w, float h,
+    DWORD color
+)
+{
+    DX8StateBackup state;
+    BackupState(dev, state);
+
+    // Estados para overlay
+    dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+
+    dev->SetTexture(0, nullptr);
+    dev->SetVertexShader(FVF);
+
+    VERTEX v[5] =
+    {
+        { x,     y,     0.f, 1.f, color },
+        { x + w, y,     0.f, 1.f, color },
+        { x + w, y + h, 0.f, 1.f, color },
+        { x,     y + h, 0.f, 1.f, color },
+        { x,     y,     0.f, 1.f, color }
+    };
+
+    dev->DrawPrimitiveUP(D3DPT_LINESTRIP, 4, v, sizeof(VERTEX));
+
+    RestoreState(dev, state);
+}
+
+
+
+
+HRESULT STDMETHODCALLTYPE hkEndScene(IDirect3DDevice8* pDevice)
+{
+
+    //hacer lo que sea
+    //printf("hooked\n");
+
+    /*
+    pDevice->SetRenderState(D3DRS_ZENABLE, FALSE);
+    pDevice->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    pDevice->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    pDevice->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
+
+    */
+    DrawRectDX8_Safe(pDevice, 100, 100, 200, 150, 0xFFFF0000);
+
+    return oEndScene(pDevice);
+}
+
+
+
+BOOL get_3d_device(void** pointer_table, size_t size)
+{
+    IDirect3D8* d3d = Direct3DCreate8(D3D_SDK_VERSION);
+    if (!d3d)
+        return false;
+
+    //  Crear ventana dummy REAL
+    WNDCLASSEXA wc = {
+        sizeof(WNDCLASSEXA),
+        CS_CLASSDC,
+        DefWindowProcA,
+        0L, 0L,
+        GetModuleHandle(NULL),
+        NULL, NULL, NULL, NULL,
+        "DX8Dummy",
+        NULL
+    };
+
+    RegisterClassExA(&wc);
+
+    HWND hWnd = CreateWindowA(
+        "DX8Dummy",
+        "DX8Dummy",
+        WS_OVERLAPPEDWINDOW,
+        0, 0, 100, 100,
+        NULL, NULL, wc.hInstance, NULL
+    );
+
+    if (!hWnd)
+        return false;
+
+    // OBTENER formato real del escritorio
+    D3DDISPLAYMODE d3ddm;
+    if (FAILED(d3d->GetAdapterDisplayMode(D3DADAPTER_DEFAULT, &d3ddm)))
+        return false;
+
+    // 3 Inicializar TODOS los campos obligatorios
+    D3DPRESENT_PARAMETERS d3dpp;
+    ZeroMemory(&d3dpp, sizeof(d3dpp));
+
+    d3dpp.Windowed = TRUE;
+    d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+    d3dpp.BackBufferFormat = d3ddm.Format;   //  CLAVE
+    d3dpp.BackBufferWidth = 1;
+    d3dpp.BackBufferHeight = 1;
+    d3dpp.EnableAutoDepthStencil = FALSE;
+    d3dpp.hDeviceWindow = hWnd;
+
+    // Crear device HAL + SOFTWARE VP
+    IDirect3DDevice8* device = nullptr;
+
+    HRESULT hr = d3d->CreateDevice(
+        D3DADAPTER_DEFAULT,
+        D3DDEVTYPE_HAL,                     //  NUNCA REF
+        hWnd,
+        D3DCREATE_SOFTWARE_VERTEXPROCESSING, //  NUNCA HW
+        &d3dpp,
+        &device
+    );
+
+    if (FAILED(hr))
+    {
+        DestroyWindow(hWnd);
+        d3d->Release();
+        return false;
+    }
+
+    // 5 Copiar vtable
+    memcpy(pointer_table, *(void***)(device), size);
+
+    device->Release();
+    d3d->Release();
+    DestroyWindow(hWnd);
+
+    return true;
+}
+class vtRenderScene;  // Forward declaration
+DWORD WINAPI EntryThread(LPVOID)
+{
+    printf("iniciao");
+
+
+    if (!get_3d_device(d3d8table, sizeof(d3d8table)))
+        return 0;
+
+    MH_Initialize();
+
+    MH_CreateHook(
+        d3d8table[35], // EndScene DX8
+        (LPVOID)&hkEndScene,
+        reinterpret_cast<void**>(&oEndScene)
+    );
+
+    MH_EnableHook(d3d8table[35]);
+    HMODULE hMod = GetModuleHandleA("vtkernel.dll");
+    VtMessageBox vtMessageBox = (VtMessageBox)GetProcAddress(
+        hMod,
+        "?vtMessageBox@@YAXABVCString@@@Z"
+    );
+    VtGraph_TestCooperativeLevel vtGraph_TestCooperativeLevel = (VtGraph_TestCooperativeLevel)GetProcAddress(
+        hMod,
+        "?vtGraph_TestCooperativeLevel@@YA_NXZ"
+    );
+    VtGraph_DebugInfo_GetNumDrawPolys vtGraph_DebugInfo_GetNumDrawPolys = (VtGraph_DebugInfo_GetNumDrawPolys)GetProcAddress(
+        hMod,
+        "?vtGraph_DebugInfo_GetNumDrawPolys@@YAHXZ"
+    );
+    SetDebugMsgRender setDebugMsgRender =
+        (SetDebugMsgRender)GetProcAddress(
+            hMod,
+            "?SetDebugMsgRender@@YAX_N@Z"
+        );
+
+    VtEnableLogs vtEnableLogs =
+        (VtEnableLogs)GetProcAddress(
+            hMod,
+            "?vtEnableLogs@@YAX_N@Z"
+        );
+    vtRenderScene** ppMainRenderScene =
+        (vtRenderScene**)GetProcAddress(hMod, "?mainRenderScene@@3PAVvtRenderScene@@A");
+    if (ppMainRenderScene && *ppMainRenderScene && setDebugMsgRender && vtEnableLogs)
+    {
+        printf("setDebugMsgRender()\n");
+        vtEnableLogs(TRUE);
+        setDebugMsgRender(TRUE);
+        vtGraph_DebugInfo_GetNumDrawPolys(TRUE);
+        vtGraph_TestCooperativeLevel();
+        ATL::CString aCString = ATL::CString("ahi va el torito el torito guapo!");
+        vtMessageBox(aCString);
+
+
+
+    }
+    printf("FIN");
+    return 0;
+}
+
+BOOL APIENTRY DllMain(
+    HMODULE hModule,
+    DWORD  ul_reason_for_call,
+    LPVOID
+)
+{
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH)
+    {
+        AllocConsole();
+        freopen("CONIN$", "r", stdin);
+        freopen("CONOUT$", "w", stdout);
+        g_hModule = hModule;
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, EntryThread, nullptr, 0, nullptr);
+    }
+    else if (ul_reason_for_call == DLL_PROCESS_DETACH)
+    {
+        MH_DisableHook(MH_ALL_HOOKS);
+        MH_Uninitialize();
+    }
+    return TRUE;
+}

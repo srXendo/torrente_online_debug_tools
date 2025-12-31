@@ -1,0 +1,4 @@
+g++ -shared -o tol_dll.dll dllmain.cpp -static-libgcc -static-libstdc++ -ld3d8 -luser32 -lcomctl32
+
+
+g++ -I D:\DXSDK\include -I C:\Users\XendoJr\Downloads\MM\minhook\include -shared -o tol_dll.dll dll_load_map.cpp -static-libgcc -static-libstdc++ -ld3d8 -luser32 -L D:\DXSDK\lib -lMinHook
